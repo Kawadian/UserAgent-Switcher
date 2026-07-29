@@ -1,0 +1,100 @@
+name: Build Chrome Extension
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Regenerate User-Agent lists
+        working-directory: node
+        run: node build.js
+
+      - name: Read extension version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./v3/manifest.json').version")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Extension version: ${VERSION}"
+
+      - name: Validate extension package
+        run: |
+          test -f v3/manifest.json
+          node -e "
+            const m = require('./v3/manifest.json');
+            if (m.manifest_version !== 3) throw new Error('Expected Manifest V3');
+            if (!m.version) throw new Error('Missing version');
+            console.log('manifest.json OK:', m.name, m.version);
+          "
+          test -f v3/worker.js
+          test -d v3/data
+          test -d v3/_locales
+
+      - name: Package Chrome extension ZIP
+        run: |
+          mkdir -p dist
+          VERSION="${{ steps.version.outputs.version }}"
+          ZIP_NAME="useragent-switcher-chrome-v${VERSION}.zip"
+          # Zip contents of v3/ so manifest.json is at the archive root
+          # (required for Chrome Web Store / unpacked install after unzip)
+          (
+            cd v3
+            zip -r "../dist/${ZIP_NAME}" . \
+              -x '*.DS_Store' \
+              -x '*__MACOSX*' \
+              -x '*.git*'
+          )
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          ls -lh "dist/${ZIP_NAME}"
+          unzip -l "dist/${ZIP_NAME}" | sed -n '1,20p'
+          unzip -l "dist/${ZIP_NAME}" | grep -E 'manifest\.json$'
+        id: package
+
+      - name: Upload Chrome extension artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: useragent-switcher-chrome-v${{ steps.version.outputs.version }}
+          path: dist/${{ steps.package.outputs.zip_name }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
